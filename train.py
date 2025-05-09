@@ -62,6 +62,7 @@ use_layer_norm = True
 use_rope = False
 use_flash_attn = True
 use_sparse_attn = False
+use_mqa = False
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -164,7 +165,8 @@ model_args = dict(
     use_layer_norm=use_layer_norm,
     use_rope=use_rope,
     use_flash_attn=use_flash_attn,
-    use_sparse_attn=use_sparse_attn
+    use_sparse_attn=use_sparse_attn,
+    use_mqa=use_mqa
 )
 if init_from == 'scratch':
     # init a new model from scratch
