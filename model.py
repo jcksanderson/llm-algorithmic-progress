@@ -20,13 +20,7 @@ import os
 import traceback
 from datetime import datetime
 
-try:
-    # Only import if available
-    import deepspeed
-    from deepspeed.ops.sparse_attention import SparseSelfAttention
-    HAS_DEEPSPEED = True
-except ImportError:
-    HAS_DEEPSPEED = False
+from native_sparse_attention_pytorch import SparseAttention
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -61,191 +55,66 @@ class CausalSelfAttention(nn.Module):
         """Returns the name of the attention mechanism currently being used."""
         return self._active_attn_mechanism
         
-    def __init__(self, config):
+    def __init__(self, config): 
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        self.dropout = config.dropout
-        
-        # Add a property to track which attention mechanism is actually being used
-        self._active_attn_mechanism = "unknown"
-        
-        # Add MQA toggle
-        self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
-        
-        if self.use_mqa:
-            # For MQA: Multiple query heads, single key/value head
-            self.c_attn = nn.Linear(config.n_embd, 
-                                   config.n_embd +  # For all query heads
-                                   2 * self.head_dim,  # For single key and value head
-                                   bias=config.bias)
-        else:
-            # Standard attention: key, query, value projections for all heads
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-            
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.dropout = config.dropout # General dropout rate for resid_dropout
 
-        # Feature toggles
-        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
-        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
-        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
-                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
-        
-        # Initialize RoPE parameters if enabled
-        if self.use_rope:
-            self.head_dim = self.n_embd // self.n_head
-            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-            self.register_buffer("inv_freq", inv_freq)
-        
-        # Initialize causal mask for non-flash attention
-        if not self.use_flash_attn:
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                      .view(1, 1, config.block_size, config.block_size))
-        
-        # Create a timestamp for the error log file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.error_log_file = f"deepspeed_error_{timestamp}.log"
-        
-        # Initialize DeepSpeed sparse attention if available and enabled
-        self.ds_sparse_attn = None
+        # --- Layers for Standard and Flash Attention Paths ---
+        # These will be BYPASSED if use_sparse_attn is True.
+        self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
+        if self.use_mqa:
+            self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.head_dim, bias=config.bias)
+        else:
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout) # For standard attention's softmax output
+        # --- End of Standard/Flash specific layers ---
+
+        # This residual dropout is applied at the end of the forward method for all paths
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # --- Feature Toggles & Module Initializations ---
+        self.use_rope = config.use_rope # Will only be used if not native_sparse_attn
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn
+                               and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+
+        self.use_sparse_attn = config.use_sparse_attn
+        self.native_sparse_attn_module = None
+        self._active_attn_mechanism = "standard" # Default
+
         if self.use_sparse_attn:
-            print("\n" + "="*80)
-            print("ATTENTION MECHANISM: Attempting to initialize DeepSpeed Sparse Attention")
-            
-            try:
-                # Try to import DeepSpeed
-                import deepspeed
-                from deepspeed.ops.sparse_attention import SparseSelfAttention
-                
-                # KEY FIX: Import SparsityConfig class instead of using a dictionary
-                try:
-                    # First try the current import path
-                    from deepspeed.ops.sparse_attention import SparsityConfig
-                    
-                    # Create SparsityConfig object
-                    sparsity_config = SparsityConfig(
-                        mode="fixed",
-                        block=16,
-                        different_layout_per_head=True,
-                        num_local_blocks=4,
-                        num_global_blocks=1,
-                        horizontal_global_attention=False,
-                        num_different_global_patterns=4
-                    )
-                    
-                    # Initialize DeepSpeed sparse attention with the SparsityConfig object
-                    self.ds_sparse_attn = SparseSelfAttention(
-                        sparsity_config=sparsity_config,
-                        max_seq_length=config.block_size,
-                        attn_mask_mode='add'
-                    )
-                    
-                    self._active_attn_mechanism = "deepspeed_sparse"
-                    print("ATTENTION MECHANISM: DeepSpeed Sparse Attention SUCCESSFULLY initialized")
-                
-                except (ImportError, AttributeError) as config_err:
-                    # If that fails, try the legacy/alternate import path
-                    try:
-                        error_msg = f"First attempt failed: {str(config_err)}\n"
-                        error_msg += "Trying alternate approach with legacy API...\n"
-                        
-                        # Try legacy format by importing specific pattern classes
-                        from deepspeed.ops.sparse_attention import FixedSparsityConfig
-                        
-                        # Create FixedSparsityConfig object for "fixed" mode
-                        sparsity_config = FixedSparsityConfig(
-                            num_heads=config.n_head,
-                            block=16,
-                            different_layout_per_head=True,
-                            num_local_blocks=4,
-                            num_global_blocks=1,
-                            num_different_global_patterns=4,
-                            attention_dropout=config.dropout
-                        )
-                        
-                        # Initialize with the config object
-                        self.ds_sparse_attn = SparseSelfAttention(
-                            sparsity_config=sparsity_config,
-                            max_seq_length=config.block_size,
-                            attn_mask_mode='add'
-                        )
-                        
-                        self._active_attn_mechanism = "deepspeed_sparse"
-                        print("ATTENTION MECHANISM: DeepSpeed Sparse Attention initialized with legacy API")
-                        
-                    except Exception as legacy_err:
-                        error_msg += f"Legacy approach also failed: {str(legacy_err)}\n"
-                        error_msg += "Full traceback (legacy attempt):\n"
-                        error_msg += traceback.format_exc()
-                        
-                        with open(self.error_log_file, "w") as f:
-                            f.write(error_msg)
-                        
-                        print(f"ATTENTION MECHANISM: Both modern and legacy API attempts failed")
-                        print(f"ATTENTION MECHANISM: Error details written to {self.error_log_file}")
-                        print(f"ATTENTION MECHANISM: Falling back to standard attention")
-                        
-                        self.ds_sparse_attn = None
-                        self.use_sparse_attn = False
-                        self._active_attn_mechanism = "standard_fallback"
-                        
-            except Exception as e:
-                # Log the error to a file
-                error_msg = f"DeepSpeed initialization error: {str(e)}\n"
-                error_msg += "Full traceback:\n"
-                error_msg += traceback.format_exc()
-                
-                with open(self.error_log_file, "w") as f:
-                    f.write(error_msg)
-                
-                print(f"ATTENTION MECHANISM: Failed to initialize DeepSpeed")
-                print(f"ATTENTION MECHANISM: Error details written to {self.error_log_file}")
-                print(f"ATTENTION MECHANISM: Falling back to standard attention")
-                
-                self.ds_sparse_attn = None
-                self.use_sparse_attn = False
-                self._active_attn_mechanism = "standard_fallback"
-                
-                # Check if CUDA extensions are compatible
-                try:
-                    import deepspeed.ops.op_builder as op_builder
-                    sparse_attn_builder = op_builder.SparseAttnBuilder()
-                    if not sparse_attn_builder.is_compatible():
-                        with open(self.error_log_file, "a") as f:
-                            f.write("\n\nCUDA extension compatibility check:\n")
-                            f.write("DeepSpeed SparseAttn CUDA extension is NOT compatible with this environment.\n")
-                            f.write("This is likely due to CUDA version mismatch or missing build tools.\n")
-                            
-                        print(f"ATTENTION MECHANISM: CUDA extensions not compatible - see log for details")
-                except Exception as ce:
-                    with open(self.error_log_file, "a") as f:
-                        f.write(f"\n\nError checking CUDA compatibility: {str(ce)}\n")
-            
-            print("="*80 + "\n")
+            print("Initializing Native PyTorch Sparse Attention Module")
+            self.native_sparse_attn_module = SparseAttention(
+                dim = config.n_embd,
+                dim_head = self.head_dim,
+                heads = self.n_head,
+                sliding_window_size = 2,
+                compress_block_size = 4,
+                compress_block_sliding_stride = 2,
+                selection_block_size = 4,
+                num_selected_blocks = 2,
+                causal = True
+            )
+            self._active_attn_mechanism = "native_sparse_pytorch"
         elif self.use_flash_attn:
             self._active_attn_mechanism = "flash"
-            print("\n" + "="*80)
-            print("ATTENTION MECHANISM: Using Flash Attention")
-            print("="*80 + "\n")
-        else:
-            self._active_attn_mechanism = "standard"
-            print("\n" + "="*80)
-            print("ATTENTION MECHANISM: Using Standard Attention")
-            print("="*80 + "\n")
+        # else: _active_attn_mechanism remains "standard"
+
+        print(f"CausalSelfAttention configured to use: {self._active_attn_mechanism} attention")
+
+        # RoPE parameters are only needed if RoPE is used (i.e., for Flash/Standard paths)
+        if self.use_rope and not self.use_sparse_attn:
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer("inv_freq", inv_freq)
+
+        # Causal mask for standard attention (if it's the active path)
+        if self._active_attn_mechanism == "standard":
+             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                 .view(1, 1, config.block_size, config.block_size))
             
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
@@ -253,104 +122,62 @@ class CausalSelfAttention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
-    def forward(self, x):
-        B, T, C = x.size()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size() # Batch, Sequence Length, Embedding Dimensionality
         
-        # First forward pass detection
-        if not hasattr(self, '_first_forward_done'):
-            self._first_forward_done = True
-            print("\n" + "="*80)
-            print(f"ATTENTION MECHANISM [FIRST FORWARD PASS]: Using {self._active_attn_mechanism} attention")
-            print("="*80 + "\n")
-            
-        if self.use_mqa:
-            # MQA implementation
-            qkv = self.c_attn(x)
-            
-            # Split into query (all heads), key (single head), value (single head)
-            q = qkv[:, :, :self.n_embd]  # B, T, n_embd
-            k = qkv[:, :, self.n_embd:self.n_embd + self.head_dim]  # B, T, head_dim
-            v = qkv[:, :, -self.head_dim:]  # B, T, head_dim
-            
-            # Reshape query to heads
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
-            
-            # For key and value, expand single head to all heads
-            k = k.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
-            v = v.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
+        # This will hold the output of the attention mechanism + output projection
+        # It should have shape (B, T, C) before the final residual dropout
+        y: torch.Tensor 
+
+        if self.use_sparse_attn and self.native_sparse_attn_module is not None:
+            y = self.native_sparse_attn_module(x)
+
         else:
-            # Standard attention implementation
-            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        
-        # Apply RoPE if enabled
-        if self.use_rope:
-            cos, sin = self._get_rotary_embeddings(T, x.device)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        
-        # Attention mechanism selection
-        if self.use_flash_attn:
-            # Flash attention
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True
-            )
-        elif self.use_sparse_attn and self.ds_sparse_attn is not None:
-            # DeepSpeed sparse attention
-            try:
-                # Reshape tensors to what DeepSpeed expects: [seq_len, batch_size, num_heads, head_size]
-                q_ds = q.permute(2, 0, 1, 3)  # [T, B, nh, hs]
-                k_ds = k.permute(2, 0, 1, 3)  # [T, B, nh, hs]
-                v_ds = v.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+            # --- Flash Attention or Standard Attention Path ---
+            # 1. QKV projections
+            if self.use_mqa:
+                qkv = self.c_attn(x)
+                q_embd = qkv[:, :, :self.n_embd] # Query uses full embedding space before splitting to heads
+                k_single_head = qkv[:, :, self.n_embd : self.n_embd + self.head_dim]
+                v_single_head = qkv[:, :, -self.head_dim:]
                 
-                # Create attention mask
-                attention_mask = torch.tril(torch.ones(T, T, device=x.device))
-                attention_mask = attention_mask.view(1, 1, T, T)
-                
-                # Call DeepSpeed sparse attention
-                attn_output = self.ds_sparse_attn(
-                    q_ds, k_ds, v_ds,
-                    key_padding_mask=None,
-                    attn_mask=attention_mask
-                )
-                
-                # Reshape back to expected output format [B, nh, T, hs]
-                y = attn_output.permute(1, 2, 0, 3)
-            except Exception as e:
-                # Log the error to a file
-                forward_error_file = f"deepspeed_forward_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-                error_msg = f"DeepSpeed sparse attention forward pass error: {str(e)}\n"
-                error_msg += "Full traceback:\n"
-                error_msg += traceback.format_exc()
-                
-                with open(forward_error_file, "w") as f:
-                    f.write(error_msg)
-                
-                print(f"\nERROR: DeepSpeed sparse attention failed during forward pass")
-                print(f"Error details written to {forward_error_file}")
-                print(f"Falling back to standard attention for this forward pass\n")
-                
-                # Fallback to standard attention for this forward pass
+                q = q_embd.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+                # Expand K and V from single head to all query heads for MQA
+                k = k_single_head.unsqueeze(1).expand(B, self.n_head, T, self.head_dim) # (B, nh, T, hs)
+                v = v_single_head.unsqueeze(1).expand(B, self.n_head, T, self.head_dim) # (B, nh, T, hs)
+            else: # Standard Multi-Head Attention
+                q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+                q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+                k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+                v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+
+            # 2. Apply RoPE if enabled (only for Flash/Standard paths now)
+            if self.use_rope:
+                cos, sin = self._get_rotary_embeddings(T, x.device) # _get_rotary_embeddings is from your original code
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)       # apply_rotary_pos_emb is from your original code
+            
+            # 3. Attention Calculation
+            if self.use_flash_attn:
+                # Flash Attention uses a fused kernel
+                y_heads = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, 
+                    attn_mask=None, # is_causal=True handles causal masking
+                    dropout_p=self.dropout if self.training else 0, # Flash Attn can handle dropout
+                    is_causal=True
+                ) # (B, nh, T, hs)
+            else: # Standard Self-Attention
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                 att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
                 att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v
-        else:
-            # Standard attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
-        
-        # Rest of the forward pass
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
+                att = self.attn_dropout(att) # Apply attention dropout
+                y_heads = att @ v # (B, nh, T, hs)
+            
+            # 4. Re-assemble heads and apply output projection
+            y_concatenated_heads = y_heads.transpose(1, 2).contiguous().view(B, T, C)
+            y = self.c_proj(y_concatenated_heads)
+
+        # Apply final residual dropout for all paths
+        y = self.resid_dropout(y)
         return y
     
 class MLP(nn.Module):
