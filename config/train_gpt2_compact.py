@@ -12,7 +12,7 @@ n_layer = 8
 n_head = 8
 n_embd = 512
 block_size = 512
-dropout = 0.1  # Slightly reduced for faster training
+dropout = 0.0  # Slightly reduced for faster training
 
 #Toggling algorithmic improvements:
 use_layer_norm = False
@@ -24,8 +24,8 @@ use_mqa = False
 # Batch size configuration
 # Original: 12 * 1024 * 40 = 491,520
 # New: 64 * 512 * 8 = 262,144 (still substantial)
-batch_size = 64
-gradient_accumulation_steps = 8
+batch_size = 128
+gradient_accumulation_steps = 4
 
 # Training schedule - reduced for faster results
 max_iters = 50000  
@@ -46,9 +46,9 @@ decay_lr = True
 lr_decay_type = 'cosine'  # Keep this parameter
 
 # Evaluation settings
-eval_interval = 500
+eval_interval = 5000
 eval_iters = 100
-log_interval = 10
+log_interval = 50
 
 # Regularization
 weight_decay = 1e-1
