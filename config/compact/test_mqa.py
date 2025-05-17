@@ -1,10 +1,10 @@
 # config/test_mqa.py
-from config.train_gpt2_compact import *  # Import base config
+from config.compact.train_gpt2_compact import *  # Import base config
 
 # Override with specific configuration
 wandb_log = True
 wandb_project = 'llm-progress'
-wandb_run_name = 'mqa'
+wandb_run_name = 'compact - mqa'
 
 # Feature toggles
 use_layer_norm = False

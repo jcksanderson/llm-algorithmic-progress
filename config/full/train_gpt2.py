@@ -1,20 +1,14 @@
-# config for training compact GPT-2 (~50M) - optimized for faster training
-# launch as: $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2_compact.py
-
-# wandb logging setup
-wandb_log = True
-wandb_project = 'owt'
-wandb_run_name = 'gpt2-50M-h100-fast'
+# config for training full GPT-2 (~124M)
 
 # Model architecture changes
-# Total params reduced from 124M to ~50M
-n_layer = 8
-n_head = 8
-n_embd = 512
-block_size = 512
-dropout = 0.0  # Slightly reduced for faster training
+# Total params ~124M
+n_layer = 12
+n_head = 12
+n_embd = 768
+block_size = 1024
+dropout = 0.0  # for faster training
 
-#Toggling algorithmic improvements:
+# Toggling algorithmic improvements:
 use_layer_norm = False
 use_rope = False
 use_flash_attn = False
@@ -22,8 +16,6 @@ use_sparse_attn = False
 use_mqa = False 
 
 # Batch size configuration
-# Original: 12 * 1024 * 40 = 491,520
-# New: 64 * 512 * 8 = 262,144 (still substantial)
 batch_size = 128
 gradient_accumulation_steps = 4
 
@@ -46,7 +38,7 @@ decay_lr = True
 lr_decay_type = 'cosine'  # Keep this parameter
 
 # Evaluation settings
-eval_interval = 5000
+eval_interval = 500
 eval_iters = 100
 log_interval = 50
 
