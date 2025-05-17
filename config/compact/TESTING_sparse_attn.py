@@ -8,7 +8,9 @@ use_sparse_attn = True
 use_mqa = False
 
 # no logging
-wandb_log = False 
+wandb_log = True
+wandb_project = 'llm-progress'
+wandb_run_name = 'lambda test'
 
 # --- Make the run short for testing ---
 max_iters = 200          # Total training iterations
