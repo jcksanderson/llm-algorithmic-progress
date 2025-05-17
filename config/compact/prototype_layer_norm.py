@@ -1,16 +1,16 @@
 from config.compact.train_gpt2_compact import *  # Import base config
 
 # Feature toggles
-use_layer_norm = False
+use_layer_norm = True
 use_rope = False
 use_flash_attn = False
-use_sparse_attn = True
+use_sparse_attn = False
 use_mqa = False
 
 # no logging
 wandb_log = True
 wandb_project = 'llm-progress'
-wandb_run_name = 'lambda test'
+wandb_run_name = 'lambda test (1)'
 
 # --- Make the run short for testing ---
 max_iters = 200          # Total training iterations
