@@ -186,7 +186,7 @@ class CausalSelfAttention(nn.Module):
         # It should have shape (B, T, C) before the final residual dropout
         y: torch.Tensor 
 
-        if self.use_sparse_attn and self.native_sparse_attn_module is not None:
+        if self.use_sparse_attn:
             # --- Sparse Attention Path (parallel_nsa) ---
             # No RoPE, No MQA sharing with standard path. Uses its own projections and head config.
             
