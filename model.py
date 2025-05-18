@@ -20,7 +20,11 @@ import os
 import traceback
 from datetime import datetime
 
-from native_sparse_attention_pytorch import SparseAttention
+try:
+    from native_sparse_attention.ops.parallel import parallel_nsa
+except ImportError:
+    print("Warning: native_sparse_attention library not found. Sparse attention path will fail.")
+    parallel_nsa = None
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -55,72 +59,125 @@ class CausalSelfAttention(nn.Module):
         """Returns the name of the attention mechanism currently being used."""
         return self._active_attn_mechanism
         
-    def __init__(self, config): 
+    
+    def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-        self.dropout = config.dropout # General dropout rate for resid_dropout
-
-        # --- Layers for Standard and Flash Attention Paths ---
-        # These will be BYPASSED if use_sparse_attn is True.
-        self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
-        if self.use_mqa:
-            self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.head_dim, bias=config.bias)
-        else:
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.attn_dropout = nn.Dropout(config.dropout) # For standard attention's softmax output
-        # --- End of Standard/Flash specific layers ---
-
-        # This residual dropout is applied at the end of the forward method for all paths
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.dropout_val = config.dropout # General dropout rate for resid_dropout
 
         # --- Feature Toggles & Module Initializations ---
-        self.use_rope = config.use_rope # Will only be used if not native_sparse_attn
+        self.use_rope = config.use_rope
         self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn
                                and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
-
         self.use_sparse_attn = config.use_sparse_attn
-        self.native_sparse_attn_module = None
+
+        # Standard path (non-sparse) parameters
+        self.n_head = config.n_head # Number of query heads for standard path
+        self.head_dim = config.n_embd // config.n_head
+        self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
+
         self._active_attn_mechanism = "standard" # Default
 
         if self.use_sparse_attn:
-            print("Initializing Native PyTorch Sparse Attention Module")
-            self.native_sparse_attn_module = SparseAttention(
-                dim = config.n_embd,
-                dim_head = self.head_dim,
-                heads = self.n_head,
-                sliding_window_size = 2,
-                compress_block_size = 4,
-                compress_block_sliding_stride = 2,
-                selection_block_size = 4,
-                num_selected_blocks = 2,
-                causal = True
-            )
-            self._active_attn_mechanism = "native_sparse_pytorch"
-        elif self.use_flash_attn:
-            self._active_attn_mechanism = "flash"
-        # else: _active_attn_mechanism remains "standard"
+            if parallel_nsa is None:
+                raise ImportError("native_sparse_attention.ops.parallel.parallel_nsa could not be imported.")
+            print("Initializing CausalSelfAttention for Native Parallel Sparse Attention (parallel_nsa)")
+            self._active_attn_mechanism = "parallel_nsa"
 
+            # Sparse path has its own head config, independent of self.use_mqa and self.use_rope
+            self.sparse_n_head = getattr(config, 'sparse_n_head', config.n_head) # Query heads for sparse
+            self.sparse_kv_n_head = getattr(config, 'sparse_kv_n_head', self.sparse_n_head) # K/V heads for sparse
+            self.sparse_head_dim = getattr(config, 'sparse_head_dim', config.n_embd // self.sparse_n_head)
+            assert config.n_embd % self.sparse_n_head == 0, "n_embd must be divisible by sparse_n_head"
+            assert self.sparse_head_dim == config.n_embd // self.sparse_n_head, "sparse_head_dim mismatch"
+
+
+            # Projections for sparse path (inspired by FLA's NativeSparseAttention)
+            self.sparse_q_proj = nn.Linear(config.n_embd, self.sparse_n_head * self.sparse_head_dim, bias=config.bias)
+            self.sparse_k_proj = nn.Linear(config.n_embd, self.sparse_kv_n_head * self.sparse_head_dim, bias=config.bias)
+            self.sparse_v_proj = nn.Linear(config.n_embd, self.sparse_kv_n_head * self.sparse_head_dim, bias=config.bias)
+            # Gate projection: num_query_heads * 3 (for g_cmp, g_slc, g_swa)
+            self.sparse_g_proj = nn.Linear(config.n_embd, self.sparse_n_head * 3, bias=False)
+            self.sparse_o_proj = nn.Linear(self.sparse_n_head * self.sparse_head_dim, config.n_embd, bias=config.bias)
+
+            # Parameters for native_sparse_attention.ops.parallel.parallel_nsa
+            self.sparse_block_size_nsa = getattr(config, 'sparse_block_size_nsa', 64)
+            self.sparse_window_size_nsa = getattr(config, 'sparse_window_size_nsa', 64) # Or 512 from FLA example
+            self.sparse_S_nsa = getattr(config, 'sparse_S_nsa', 16) # Max selected blocks per query token for random part
+
+        else: # Standard or Flash Attention Path
+            if self.use_mqa:
+                # For MQA, n_head is query heads, K/V heads are fewer (typically 1 or a small group)
+                # This kv_n_head is for the standard MQA path, not sparse.
+                self.mqa_kv_n_head = getattr(config, 'mqa_kv_n_head', 1)
+                assert self.n_head % self.mqa_kv_n_head == 0, "n_head must be divisible by mqa_kv_n_head for GQA"
+                self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.mqa_kv_n_head * self.head_dim, bias=config.bias)
+            else: # Standard Multi-Head Attention (MHA)
+                self.mqa_kv_n_head = self.n_head # Effective K/V heads = Query heads
+                self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+            
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.attn_dropout = nn.Dropout(self.dropout_val) # For standard attention's softmax output
+
+            if self.use_flash_attn:
+                self._active_attn_mechanism = "flash"
+            # else: _active_attn_mechanism remains "standard"
+
+            # RoPE parameters are only needed if RoPE is used (i.e., for Flash/Standard paths)
+            if self.use_rope:
+                inv_freq = 1.0 / (getattr(config, 'rope_theta', 10000.0) ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+                self.register_buffer("inv_freq", inv_freq)
+
+            # Causal mask for standard attention (if it's the active path)
+            if self._active_attn_mechanism == "standard":
+                self.register_buffer("bias_mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
+        # This residual dropout is applied at the end of the forward method for all paths
+        self.resid_dropout = nn.Dropout(self.dropout_val)
         print(f"CausalSelfAttention configured to use: {self._active_attn_mechanism} attention")
-
-        # RoPE parameters are only needed if RoPE is used (i.e., for Flash/Standard paths)
-        if self.use_rope and not self.use_sparse_attn:
-            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-            self.register_buffer("inv_freq", inv_freq)
-
-        # Causal mask for standard attention (if it's the active path)
-        if self._active_attn_mechanism == "standard":
-             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
+        if self.use_sparse_attn:
+             print(f"  Sparse Config: QHeads={self.sparse_n_head}, KVHeads={self.sparse_kv_n_head}, HDim={self.sparse_head_dim}, Block={self.sparse_block_size_nsa}, S={self.sparse_S_nsa}, Win={self.sparse_window_size_nsa}")
+        else:
+            print(f"  Dense Config: QHeads={self.n_head}, KVHeads(MQA/GQA)={self.mqa_kv_n_head if self.use_mqa else self.n_head}, HDim={self.head_dim}, RoPE={self.use_rope}, MQA/GQA={self.use_mqa}")
             
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
+
+    def _generate_causal_sparse_indices(self, B, T, H_kv_sparse, S_sparse, block_size_sparse, device, dtype):
+        max_valid_block_idx_for_seq = (T - 1) // block_size_sparse
+        padding_block_idx = max_valid_block_idx_for_seq + 1 # Sentinel for padding
+
+        block_indices = torch.full((B, T, H_kv_sparse, S_sparse),
+                                   padding_block_idx,
+                                   dtype=torch.long, device=device)
+        block_counts = torch.zeros((B, T, H_kv_sparse), dtype=torch.long, device=device)
+
+        for b_idx in range(B):
+            for t_idx in range(T):
+                current_max_attendable_block_idx = t_idx // block_size_sparse
+                num_available_blocks = current_max_attendable_block_idx + 1
+                for h_idx in range(H_kv_sparse):
+                    if num_available_blocks <= 0:
+                        actual_selected_count = 0
+                    elif num_available_blocks == 1:
+                        selected_block_idxs = torch.tensor([0], device=device, dtype=torch.long)
+                        actual_selected_count = 1
+                    else:
+                        num_to_select = min(S_sparse, num_available_blocks)
+                        perm = torch.randperm(num_available_blocks, device=device)[:num_to_select]
+                        selected_block_idxs = perm
+                        actual_selected_count = num_to_select
+                    
+                    block_indices[b_idx, t_idx, h_idx, :actual_selected_count] = selected_block_idxs
+                    block_counts[b_idx, t_idx, h_idx] = actual_selected_count
+        
+        block_indices = block_indices.sort(dim=-1)[0]
+        return block_indices, block_counts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size() # Batch, Sequence Length, Embedding Dimensionality
@@ -130,7 +187,50 @@ class CausalSelfAttention(nn.Module):
         y: torch.Tensor 
 
         if self.use_sparse_attn and self.native_sparse_attn_module is not None:
-            y = self.native_sparse_attn_module(x)
+            # --- Sparse Attention Path (parallel_nsa) ---
+            # No RoPE, No MQA sharing with standard path. Uses its own projections and head config.
+            
+            # 1. Projections for sparse path
+            q_s = self.sparse_q_proj(x) # (B, T, sparse_n_head * sparse_head_dim)
+            k_s = self.sparse_k_proj(x) # (B, T, sparse_kv_n_head * sparse_head_dim)
+            v_s = self.sparse_v_proj(x) # (B, T, sparse_kv_n_head * sparse_head_dim)
+            g_s = self.sparse_g_proj(x) # (B, T, sparse_n_head * 3)
+
+            # Reshape Q, K, V, G for parallel_nsa (expects B, T, H, D - head_first=False convention)
+            q_s = q_s.view(B, T, self.sparse_n_head, self.sparse_head_dim)
+            k_s = k_s.view(B, T, self.sparse_kv_n_head, self.sparse_head_dim)
+            v_s = v_s.view(B, T, self.sparse_kv_n_head, self.sparse_head_dim)
+            
+            g_s_reshaped = g_s.view(B, T, self.sparse_n_head, 3) # (B, T, HQ_sparse, 3)
+            # Order g_cmp, g_slc, g_swa matches FLA example if unbind dim is -1
+            g_cmp, g_slc, g_swa = g_s_reshaped.sigmoid().unbind(dim=-1) # Each (B, T, HQ_sparse)
+
+            # 2. Generate block_indices and block_counts for parallel_nsa
+            block_indices, block_counts = self._generate_causal_sparse_indices(
+                B, T, self.sparse_kv_n_head, self.sparse_S_nsa, self.sparse_block_size_nsa, x.device, x.dtype
+            )
+            
+            # 3. Call parallel_nsa
+            y_heads = parallel_nsa(
+                q=q_s, k=k_s, v=v_s,
+                g_cmp=g_cmp,
+                g_slc=g_slc,
+                g_swa=g_swa,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                block_size=self.sparse_block_size_nsa,
+                window_size=self.sparse_window_size_nsa,
+                # cu_seqlens=None, # Assuming not needed for now
+                # head_first=False # FLA example implies this is default or handled by reshape
+            ) # Output shape is (B, T, sparse_n_head, sparse_head_dim)
+
+            # 4. Output projection for sparse path
+            # y_heads is (B, T, sparse_n_head, sparse_head_dim)
+            # Ensure total embedding dim C is sparse_n_head * sparse_head_dim for this path
+            y_concatenated_heads = y_heads.contiguous().view(B, T, self.sparse_n_head * self.sparse_head_dim)
+            assert y_concatenated_heads.size(-1) == C, \
+                f"Output embedding dim mismatch in sparse path. Expected {C}, got {y_concatenated_heads.size(-1)}"
+            y = self.sparse_o_proj(y_concatenated_heads)
 
         else:
             # --- Flash Attention or Standard Attention Path ---
