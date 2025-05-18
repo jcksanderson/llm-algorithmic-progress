@@ -214,7 +214,7 @@ class CausalSelfAttention(nn.Module):
                 y_heads = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v, 
                     attn_mask=None, # is_causal=True handles causal masking
-                    dropout_p=self.dropout if self.training else 0, # Flash Attn can handle dropout
+                    dropout_p=self.dropout_val if self.training else 0, # Flash Attn can handle dropout
                     is_causal=True
                 ) # (B, nh, T, hs)
             else: # Standard Self-Attention
