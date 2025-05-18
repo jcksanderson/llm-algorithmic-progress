@@ -26,6 +26,14 @@ except ImportError:
     print("Warning: native_sparse_attention library not found. Sparse attention path will fail.")
     parallel_nsa = None
 
+class IdentityRotary(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, q, k, **kwargs):
+        return q, k
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -90,11 +98,10 @@ class CausalSelfAttention(nn.Module):
                 block_size=getattr(config, 'sparse_block_size_nsa', 64),
                 block_counts=getattr(config, 'sparse_S_nsa', 16), # This is 'S', the int count
                 window_size=getattr(config, 'sparse_window_size_nsa', 512), # FLA example uses 512
-                rope_theta=None, # TO SATISFY YOUR NO-ROPE CONSTRAINT (verify this disables RoPE in RotaryEmbedding)
                 # max_position_embeddings=config.block_size, # Or as needed
                 # layer_idx= ... # If relevant for caching in your setup
             )
-            self.fla_nsa_module.rotary = lambda q, k, **kwargs: (q, k)
+            self.fla_nsa_module.rotary = IdentityRotary()
         else: # Standard or Flash Attention Path
             if self.use_mqa:
                 # For MQA, n_head is query heads, K/V heads are fewer (typically 1 or a small group)
@@ -126,10 +133,10 @@ class CausalSelfAttention(nn.Module):
         # This residual dropout is applied at the end of the forward method for all paths
         self.resid_dropout = nn.Dropout(self.dropout_val)
         print(f"CausalSelfAttention configured to use: {self._active_attn_mechanism} attention")
-        if self.use_sparse_attn:
-             print(f"  Sparse Config: QHeads={self.sparse_n_head}, KVHeads={self.sparse_kv_n_head}, HDim={self.sparse_head_dim}, Block={self.sparse_block_size_nsa}, S={self.sparse_S_nsa}, Win={self.sparse_window_size_nsa}")
-        else:
-            print(f"  Dense Config: QHeads={self.n_head}, KVHeads(MQA/GQA)={self.mqa_kv_n_head if self.use_mqa else self.n_head}, HDim={self.head_dim}, RoPE={self.use_rope}, MQA/GQA={self.use_mqa}")
+#         if self.use_sparse_attn:
+#              print(f"  Sparse Config: QHeads={self.sparse_n_head}, KVHeads={self.sparse_kv_n_head}, HDim={self.sparse_head_dim}, Block={self.sparse_block_size_nsa}, S={self.sparse_S_nsa}, Win={self.sparse_window_size_nsa}")
+#         else:
+#             print(f"  Dense Config: QHeads={self.n_head}, KVHeads(MQA/GQA)={self.mqa_kv_n_head if self.use_mqa else self.n_head}, HDim={self.head_dim}, RoPE={self.use_rope}, MQA/GQA={self.use_mqa}")
             
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
