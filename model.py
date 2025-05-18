@@ -94,6 +94,7 @@ class CausalSelfAttention(nn.Module):
                 # max_position_embeddings=config.block_size, # Or as needed
                 # layer_idx= ... # If relevant for caching in your setup
             )
+            self.fla_nsa_module.rotary = lambda q, k, **kwargs: (q, k)
         else: # Standard or Flash Attention Path
             if self.use_mqa:
                 # For MQA, n_head is query heads, K/V heads are fewer (typically 1 or a small group)
