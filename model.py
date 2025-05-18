@@ -97,7 +97,7 @@ class CausalSelfAttention(nn.Module):
                 qkv_bias=config.bias,
                 block_size=getattr(config, 'sparse_block_size_nsa', 64),
                 block_counts=getattr(config, 'sparse_S_nsa', 16), # This is 'S', the int count
-                window_size=getattr(config, 'sparse_window_size_nsa', 512), # FLA example uses 512
+                window_size=0
                 # max_position_embeddings=config.block_size, # Or as needed
                 # layer_idx= ... # If relevant for caching in your setup
             )
