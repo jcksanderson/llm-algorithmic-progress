@@ -16,8 +16,8 @@ use_sparse_attn = False
 use_mqa = False 
 
 # Batch size configuration
-batch_size = 128
-gradient_accumulation_steps = 4
+batch_size = 64
+gradient_accumulation_steps = 8
 
 # Training schedule - reduced for faster results
 max_iters = 50000  

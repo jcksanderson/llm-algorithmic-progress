@@ -127,7 +127,7 @@ class CausalSelfAttention(nn.Module):
 
             # Causal mask for standard attention (if it's the active path)
             if self._active_attn_mechanism == "standard":
-                self.register_buffer("bias_mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
         # This residual dropout is applied at the end of the forward method for all paths
