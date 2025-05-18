@@ -21,7 +21,7 @@ import traceback
 from datetime import datetime
 
 try:
-    from native_sparse_attention.ops.parallel import parallel_nsa
+    from native_sparse_attention.modeling_nsa import NativeSparseAttention
 except ImportError:
     print("Warning: native_sparse_attention library not found. Sparse attention path will fail.")
     parallel_nsa = None
@@ -80,32 +80,20 @@ class CausalSelfAttention(nn.Module):
         self._active_attn_mechanism = "standard" # Default
 
         if self.use_sparse_attn:
-            if parallel_nsa is None:
-                raise ImportError("native_sparse_attention.ops.parallel.parallel_nsa could not be imported.")
-            print("Initializing CausalSelfAttention for Native Parallel Sparse Attention (parallel_nsa)")
-            self._active_attn_mechanism = "parallel_nsa"
-
-            # Sparse path has its own head config, independent of self.use_mqa and self.use_rope
-            self.sparse_n_head = getattr(config, 'sparse_n_head', config.n_head) # Query heads for sparse
-            self.sparse_kv_n_head = getattr(config, 'sparse_kv_n_head', self.sparse_n_head) # K/V heads for sparse
-            self.sparse_head_dim = getattr(config, 'sparse_head_dim', config.n_embd // self.sparse_n_head)
-            assert config.n_embd % self.sparse_n_head == 0, "n_embd must be divisible by sparse_n_head"
-            assert self.sparse_head_dim == config.n_embd // self.sparse_n_head, "sparse_head_dim mismatch"
-
-
-            # Projections for sparse path (inspired by FLA's NativeSparseAttention)
-            self.sparse_q_proj = nn.Linear(config.n_embd, self.sparse_n_head * self.sparse_head_dim, bias=config.bias)
-            self.sparse_k_proj = nn.Linear(config.n_embd, self.sparse_kv_n_head * self.sparse_head_dim, bias=config.bias)
-            self.sparse_v_proj = nn.Linear(config.n_embd, self.sparse_kv_n_head * self.sparse_head_dim, bias=config.bias)
-            # Gate projection: num_query_heads * 3 (for g_cmp, g_slc, g_swa)
-            self.sparse_g_proj = nn.Linear(config.n_embd, self.sparse_n_head * 3, bias=False)
-            self.sparse_o_proj = nn.Linear(self.sparse_n_head * self.sparse_head_dim, config.n_embd, bias=config.bias)
-
-            # Parameters for native_sparse_attention.ops.parallel.parallel_nsa
-            self.sparse_block_size_nsa = getattr(config, 'sparse_block_size_nsa', 64)
-            self.sparse_window_size_nsa = getattr(config, 'sparse_window_size_nsa', 64) # Or 512 from FLA example
-            self.sparse_S_nsa = getattr(config, 'sparse_S_nsa', 16) # Max selected blocks per query token for random part
-
+            self._active_attn_mechanism = "parallel_nsa_fla_module"
+            self.fla_nsa_module = NativeSparseAttention(
+                hidden_size=config.n_embd,
+                num_heads=getattr(config, 'sparse_n_head', config.n_head),
+                num_kv_heads=getattr(config, 'sparse_kv_n_head', getattr(config, 'sparse_n_head', config.n_head)),
+                head_dim=getattr(config, 'sparse_head_dim', config.n_embd // getattr(config, 'sparse_n_head', config.n_head)),
+                qkv_bias=config.bias,
+                block_size=getattr(config, 'sparse_block_size_nsa', 64),
+                block_counts=getattr(config, 'sparse_S_nsa', 16), # This is 'S', the int count
+                window_size=getattr(config, 'sparse_window_size_nsa', 512), # FLA example uses 512
+                rope_theta=None, # TO SATISFY YOUR NO-ROPE CONSTRAINT (verify this disables RoPE in RotaryEmbedding)
+                # max_position_embeddings=config.block_size, # Or as needed
+                # layer_idx= ... # If relevant for caching in your setup
+            )
         else: # Standard or Flash Attention Path
             if self.use_mqa:
                 # For MQA, n_head is query heads, K/V heads are fewer (typically 1 or a small group)
@@ -187,51 +175,7 @@ class CausalSelfAttention(nn.Module):
         y: torch.Tensor 
 
         if self.use_sparse_attn:
-            # --- Sparse Attention Path (parallel_nsa) ---
-            # No RoPE, No MQA sharing with standard path. Uses its own projections and head config.
-            
-            # 1. Projections for sparse path
-            q_s = self.sparse_q_proj(x) # (B, T, sparse_n_head * sparse_head_dim)
-            k_s = self.sparse_k_proj(x) # (B, T, sparse_kv_n_head * sparse_head_dim)
-            v_s = self.sparse_v_proj(x) # (B, T, sparse_kv_n_head * sparse_head_dim)
-            g_s = self.sparse_g_proj(x) # (B, T, sparse_n_head * 3)
-
-            # Reshape Q, K, V, G for parallel_nsa (expects B, T, H, D - head_first=False convention)
-            q_s = q_s.view(B, T, self.sparse_n_head, self.sparse_head_dim)
-            k_s = k_s.view(B, T, self.sparse_kv_n_head, self.sparse_head_dim)
-            v_s = v_s.view(B, T, self.sparse_kv_n_head, self.sparse_head_dim)
-            
-            g_s_reshaped = g_s.view(B, T, self.sparse_n_head, 3) # (B, T, HQ_sparse, 3)
-            # Order g_cmp, g_slc, g_swa matches FLA example if unbind dim is -1
-            g_cmp, g_slc, g_swa = g_s_reshaped.sigmoid().unbind(dim=-1) # Each (B, T, HQ_sparse)
-
-            # 2. Generate block_indices and block_counts for parallel_nsa
-            block_indices, block_counts = self._generate_causal_sparse_indices(
-                B, T, self.sparse_kv_n_head, self.sparse_S_nsa, self.sparse_block_size_nsa, x.device, x.dtype
-            )
-            
-            # 3. Call parallel_nsa
-            y_heads = parallel_nsa(
-                q=q_s, k=k_s, v=v_s,
-                g_cmp=g_cmp,
-                g_slc=g_slc,
-                g_swa=g_swa,
-                block_indices=block_indices,
-                block_counts=block_counts,
-                block_size=self.sparse_block_size_nsa,
-                window_size=self.sparse_window_size_nsa,
-                # cu_seqlens=None, # Assuming not needed for now
-                # head_first=False # FLA example implies this is default or handled by reshape
-            ) # Output shape is (B, T, sparse_n_head, sparse_head_dim)
-
-            # 4. Output projection for sparse path
-            # y_heads is (B, T, sparse_n_head, sparse_head_dim)
-            # Ensure total embedding dim C is sparse_n_head * sparse_head_dim for this path
-            y_concatenated_heads = y_heads.contiguous().view(B, T, self.sparse_n_head * self.sparse_head_dim)
-            assert y_concatenated_heads.size(-1) == C, \
-                f"Output embedding dim mismatch in sparse path. Expected {C}, got {y_concatenated_heads.size(-1)}"
-            y = self.sparse_o_proj(y_concatenated_heads)
-
+            y, _, _ = self.fla_nsa_module(x)
         else:
             # --- Flash Attention or Standard Attention Path ---
             # 1. QKV projections
