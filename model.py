@@ -276,6 +276,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    sparse_n_head: int = 16     
+    sparse_kv_n_head: int = 1  
     
     # Feature toggles
     use_layer_norm: bool = False     # Toggle layer normalization
