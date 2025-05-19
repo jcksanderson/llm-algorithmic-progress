@@ -2,11 +2,11 @@
 
 # Model architecture changes
 # Total params ~124M
-n_layer = 12
+n_layer = 10
 n_head = 12
 n_embd = 768
 block_size = 1024
-dropout = 0.2  # for faster training
+dropout = 0.4  # for faster training
 
 # Toggling algorithmic improvements:
 use_layer_norm = False
@@ -26,8 +26,8 @@ lr_decay_iters = 50000
 
 # Learning rate configuration
 # Scaled based on model size: 6e-4 * sqrt(512/768)
-learning_rate = 6e-4  # Increased from 6e-4
-min_lr = 6e-5
+learning_rate = 3e-4  
+min_lr = 3e-5
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
