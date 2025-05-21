@@ -13,5 +13,5 @@ use_flash_attn = False
 use_sparse_attn = True
 use_mqa = False
 
-sparse_n_head = 16
-sparse_kv_n_head = 16
+sparse_n_head = 64
+sparse_kv_n_head = 4
