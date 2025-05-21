@@ -58,6 +58,9 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
+sparse_n_head = 16
+sparse_kv_n_head = 16
+
 use_layer_norm = True
 use_rope = False
 use_flash_attn = True
