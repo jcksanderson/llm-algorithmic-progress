@@ -101,6 +101,7 @@ class CausalSelfAttention(nn.Module):
                 # max_position_embeddings=config.block_size, # Or as needed
                 # layer_idx= ... # If relevant for caching in your setup
             )
+            print(f"Sparse kv heads: {getattr(config, 'sparse_kv_n_head', getattr(config, 'sparse_n_head', config.n_head))}")
             self.fla_nsa_module.rotary = IdentityRotary()
         else: # Standard or Flash Attention Path
             if self.use_mqa:
