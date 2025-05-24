@@ -4,4 +4,5 @@
 To reproduce:
 1. Install required packages in `requirements.txt`
 2. Install native sparse attention (guidelines [here](https://github.com/fla-org/native-sparse-attention))
-3. Run `run_batch_training.sh`
+3. Create the training data with `python data/openwebtext/prepare.py`
+4. Run `run_batch_training.sh`

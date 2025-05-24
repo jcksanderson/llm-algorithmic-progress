@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# exit immediately if any command exits with a non-zero status
+# Exit immediately if any command exits with a non-zero status
 set -e
 
 # HACK: ========== Compact Model Training Runs ==========
